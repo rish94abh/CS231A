@@ -1,67 +1,146 @@
-import matplotlib.pyplot as plt
-import random
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, utils
 import torch
-import torchvision
-from torch.utils.data import Dataset
-import torchvision.transforms as transforms
 
-class MNISTDatasetWrapper(Dataset):
+import numpy as np  
+import pandas as pd
+from PIL import Image
+from io import BytesIO
+import random
+from itertools import permutations
+
+def load_zip_to_mem(zip_file, is_mono=True):
     """
-    A Dataset for learning with subsets of the Fashion MNIST dataset for either the
-    original labels or labels that describe how the image has been rotated.
-    Rotations will be applied clockwise, with a random choice of one of the
-    following degrees: [0, 45, 90, 135, 180, 225, 270, 315]
-
-    - original_dataset - the fashion mnist dataset we got with torchvision
-    - pct - percent of data to use
-    - for_rotation_classification - True=Use rotation labels.
-                                    False=Use original classification labels.
+    Function to load CLEVR-D data from the zip file.
     """
+    # Load zip file into memory
+    print('Loading dataset zip file...', end='')
+    from zipfile import ZipFile
+    input_zip = ZipFile(zip_file)
+    file_dict = {name.split('/')[1]: input_zip.read(name) for 
+            name in input_zip.namelist() if '.png' in name}
+    data = []
+    for file_name in file_dict:
+      #Only deal with right rgb images, all else via dict lookup
+      if 'right' in file_name and 'CLEVR-D' not in file_name:
+        rgb_right = file_dict[file_name]
+        right_depth_name = file_name.replace('CLEVR','CLEVR-D')
+        depth_right = file_dict[right_depth_name]
+        if is_mono:
+          data.append( (rgb_right, depth_right))
+        else:
+          rgb_left = file_dict[file_name.replace('right','left')]
+          depth_left = file_dict[right_depth_name.replace('right','left')]
+          data.append( (rgb_right,rgb_left, depth_right,depth_left))
+    return data
 
-    def __init__(self, original_dataset, pct=1.0, for_rotation_classification=False):
-        self.dataset = original_dataset
-        self.dataset_size = int(len(self.dataset)*pct)
-        self.for_rotation_classification = for_rotation_classification
-        self.label_to_class = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat', 
-                               'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
-        self.imageToTensor = transforms.ToTensor()
-        self.tensorToImage = transforms.ToPILImage()
-        self.normalize = transforms.Normalize((0.2859,), (0.3530,))
-        self.denormalize = transforms.Normalize((-0.2859/0.3530,), (1.0/0.3530,))
-        self.rot_choices = [0, 45, 90, 135, 180, 225, 270, 315]
+def get_inverse_transforms():
+    """
+    Get inverse transforms to undo data normalization
+    """
+    inv_normalize_color = transforms.Normalize(
+    mean=[-0.462/0.094, -0.467/0.096, -0.469/0.101],
+    std=[1/0.094, 1/0.096, 1/0.101]
+    )
+    inv_normalize_depth = transforms.Normalize(
+    mean=[-0.480/0.295],
+    std=[1/0.295]
+    )
 
-    def __len__(self):
-        # TODO: Implement this function.
-        return None
+    return inv_normalize_color, inv_normalize_depth
+
+def get_tensor_to_image_transforms():
+    """
+    Get transforms to go from Pytorch Tensors to PIL images that can be displayed
+    """
+    tensor_to_image = transforms.ToPILImage()
+    inv_normalize_color, inv_normalize_depth = get_inverse_transforms()
+    return (transforms.Compose([inv_normalize_color,tensor_to_image]),
+            transforms.Compose([inv_normalize_depth,tensor_to_image]))
+
+class DepthDatasetMemory(Dataset):
+    """
+    The Dataset class 
+
+    Arguments:
+        data (int): list of tuples with data from the zip files
+        is_mono (boolen): whether to return monocular or stereo data
+        start_idx (int): start of index to use in data list  
+        end_idx (int): end of index to use in data list
+    """
+    def __init__(self, data, is_mono=True, start_idx=0, end_idx = None):
+        self.is_mono = is_mono
+        self.start_idx = 0
+        if end_idx is None:
+            end_idx = len(data)
+        self.end_idx = end_idx
+        self.data = list(data[start_idx:end_idx])
+
+        self.color_transform = transforms.Compose([
+        transforms.PILToTensor(),
+        transforms.ConvertImageDtype(torch.float),
+        transforms.Normalize((0.462, 0.467, 0.469), (0.094, 0.096, 0.101)),
+        ])
+
+        self.depth_transform = transforms.Compose([
+        transforms.PILToTensor(),
+        transforms.ConvertImageDtype(torch.float),
+        transforms.Normalize((0.480), (0.295)),
+        ])
+
+        self.samples = []
+        for idx in range(len(self.data)):
+            sample = self.data[idx]
+            rgb_right = self.color_transform(Image.open(BytesIO(sample[0])).convert('RGB'))
+            depth_right = self.depth_transform(Image.open(BytesIO(sample[1])).convert('L'))
+            if self.is_mono:
+              sample = {'rgb': rgb_right, 'depth': depth_right}
+            else:
+              rgb_left = self.color_transform(Image.open(BytesIO(sample[2])).convert('RGB'))
+              depth_left = self.depth_transform(Image.open(BytesIO(sample[3])).convert('L'))
+
+              sample = {'rgb_right': rgb_right, 'depth_right': depth_right,
+                        'rgb_left': rgb_left, 'depth_left': depth_left}
+            self.samples.append(sample)
 
     def __getitem__(self, idx):
-        """
-        Returns a 32x32 MNIST digit and its corresponding clothes
-        label, or if self.for_rotation_classification is true returns
-        the image rotated by a random rotation amount from
-        self.rot_choices. Note: the label should be a number between 0-7,
-        not the number of degrees to rotate by.
-        """
-        img, label = self.dataset[idx]
-        if not self.for_rotation_classification:
-            return self.normalize(img), label
-        else:
-            img = self.tensorToImage(img)
-            label = torch.tensor(int(self.label)) # TODO choose a label for rotation
-            img = None # TODO use PIL's rotate function to modify the image according to the label 
-            img = self.normalize(self.imageToTensor(img))
-            return img, torch.tensor(label).long()
+        return self.samples[idx]# TODO 
 
-    def show_batch(self, n=3):
-        fig, axs = plt.subplots(n, n)
-        fig.tight_layout()
-        for i in range(n):
-            for j in range(n):
-                rand_idx = random.randint(0, len(self)-1)
-                img, label = self.__getitem__(rand_idx)
-                axs[i, j].imshow(self.tensorToImage(self.denormalize(img)), cmap='gray')
-                if not self.for_rotation_classification:
-                    axs[i, j].set_title('Label: {0} (#{1})'.format(label.item(), self.label_to_class[label.item()]))
-                else:
-                    axs[i, j].set_title('Label: {0} ({1} Degrees)'.format(label.item(), label.item()*45))
-                axs[i, j].axis('off')
+    def __len__(self):
+        return len(self.samples) # TODO 
+
+def get_data_loaders(path, 
+                    is_mono=True, 
+                    batch_size=16, 
+                    train_test_split=0.8, 
+                    pct_dataset=1.0):
+    """
+    The function to return the Pytorch Dataloader class to iterate through
+    the dataset. 
+
+    Arguments:
+        is_mono (boolen): whether to return monocular or stereo data
+        batch_size (int): batch size for both training and testing 
+        train_test_split (float): ratio of data from training to testing
+        pct_dataset (float): percent of dataset to use 
+    """
+    #data = load_zip_to_mem(path)
+    #train_start_idx = None # TODO
+    #train_end_idx = None # TODO 
+    #test_start_idx = None # TODO 
+    #test_end_idx = None # TODO 
+
+    #training_dataset = None # TODO 
+    #testing_dataset = None # TODO 
+    
+    
+    data = load_zip_to_mem(path, is_mono)
+    data = data[:int(pct_dataset * len(data))]
+    train_end_idx = int(len(data) * train_test_split)
+    train_data = DepthDatasetMemory(data, is_mono, 0, train_end_idx)
+    test_data = DepthDatasetMemory(data, is_mono, train_end_idx, len(data))
+
+   # return (DataLoader(training_dataset, batch_size, shuffle=True, pin_memory=True),
+            #DataLoader(testing_dataset, batch_size, shuffle=False, pin_memory=True))
+    return DataLoader(train_data, batch_size, shuffle=True, pin_memory=True), \
+           DataLoader(test_data, batch_size, shuffle=False, pin_memory=True)
